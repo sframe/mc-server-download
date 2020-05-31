@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+
+##########
+# consts #
+##########
+declare -r MC_VERSION_DEFAULT=latest-release
+declare -r MC_VERSION_MANAGER=$(basename $0)
+declare -r MC_VERSION_MANIFEST_URL=${MC_VERSION_MANIFEST_URL:-https://launchermeta.mojang.com/mc/game/version_manifest.json}
+declare -r MCSVM_HOME=${MCSVM_HOME:-$HOME/.mcsvm}
+declare -r TTL=$((60 * 60 * 24 * 1)) # 24 hours
+
+
+########
+# vars #
+########
+cache_valid_until=$(date --date "now - ${TTL} sec" +%s)
+file_version_manifest="${MCSVM_HOME}/cache/manifests/version_manifest.json"
+mc_version=$MC_VERSION_DEFAULT
+verbosity=0
+
+mc_version_actual=
+mc_version_url=
+mc_server_url=
+mc_version_actual_type=
+file_version_manifest_detail=
+file_server_jar=
+
+##################
+# getopt parsing #
+##################
+OPTS=$(getopt -o "hi:v" --long "help,install:,verbose" -n "${MC_VERSION_MANAGER}" -- "$@")
+status=$?
+
+if [[ $status != 0 ]] ; then
+  display_help >&2 ;
+  exit 1 ;
+fi
+
+eval set -- "$OPTS"
+
+while true; do
+  case "$1" in
+    -h | --help    ) display_help; exit; ;;
+    -i | --install ) mc_version=${2:-$MC_VERSION_DEFAULT}; shift 2 ;;
+    -v | --verbose ) verbosity=$((verbosity + 1)); shift ;;
+    --             ) shift; break ;;
+    *              ) break ;;
+  esac
+done
+
+
+#############
+# functions #
+#############
+function display_help ()
+{
+  cat << EOF
+
+  Minecraft-Server Version Manager
+  --------------------------------
+
+  Utility script to install any version of Minecraft-server jar that has been
+  made available for download.
+
+  Usage: $MC_VERSION_MANAGER [--install=latest-release|latest-snapshot|<version>]
+
+  optional arguments:
+    -h, --help        show this help message and exit
+    -i, --install     version to download
+    -v, --verbose     increment verbosity by 1
+
+EOF
+}
+
+function log ()
+{
+  if [[ $verbosity -gt 0 ]] ; then
+    echo $1 >&2 ;
+  fi
+}
+
+function valid_file ()
+{
+  local file=$1
+  local file_timestamp=$(date +%s -r "${file}" 2> /dev/null)
+
+  [[ -e $file ]] && [[ ${file_timestamp} -gt $cache_valid_until ]]
+}
+
+function home_dir_setup ()
+{
+  log "Setting up home directory ($MCSVM_HOME) ..."
+  mkdir -p "$MCSVM_HOME"/cache/{manifests,server}/
+}
+
+function download_manifest ()
+{
+  local url=$1
+  local file=$2
+  local silent="--silent"
+
+  if [[ $verbosity -gt 1 ]]; then
+    unset silent ;
+  fi
+
+  log "Downloading: $url -> $file ..."
+  curl $silent "$url" | jq . > "$file"
+}
+
+function cached_or_download_manifest ()
+{
+  local url=$1
+  local file=$2
+
+  if valid_file $file ; then
+    log "Using cached file: $file" ;
+  else
+    download_manifest "$url" "$file" ;
+  fi
+}
+
+function download_server ()
+{
+  local url=$1
+  local file=$2
+  local silent="--silent"
+
+  if [[ $verbosity -gt 1 ]]; then
+    unset silent ;
+  fi
+
+  log "Downloading: $url -> $file ..."
+  curl $silent "$url" -o "$file"
+}
+
+function cached_or_download_server ()
+{
+  local url=$1
+  local file=$2
+
+  if valid_file $file ; then
+    log "Using cached file: $file" ;
+  else
+    download_server "$url" "$file" ;
+  fi
+}
+
+function find_actual_version_from_manifest ()
+{
+  local version="$1"
+  local file="$2"
+  local search_version=
+
+  case "$version" in
+    latest-snapshot ) search_version=$(jq .latest.snapshot "$file" | tr -d '"') ;;
+    latest-release  ) search_version=$(jq .latest.release "$file" | tr -d '"') ;;
+    *               ) search_version="$version"
+  esac
+
+  found_version=$(jq --arg version "$search_version" -c '.versions[] | select(.id == $version) | .id' "$file" | tr -d '"')
+  found_type=$(jq --arg version "$search_version" -c '.versions[] | select(.id == $version) | .type' "$file" | tr -d '"')
+
+  if [[ ! $found_version ]] || [[ $found_version == "null" ]]; then
+    log "Version "$version" not found in version_manifest: $file"
+    return
+  fi
+
+  mc_version_actual="$found_version"
+  mc_version_actual_type="$found_type"
+  log "found \"$version\" in manifest: $mc_version_actual"
+}
+
+function find_version_url ()
+{
+  local version=$1
+  local file=$2
+  local url=$(jq --arg version "$version" -c '.versions[] | select(.id == $version) | .url' "$file" | tr -d '"')
+
+  if [[ ! $url ]] || [[ $url == "null" ]]; then
+    log "URL for version \"$version\" not found"
+    return
+  fi
+
+  mc_version_url="$url"
+  file_version_manifest_detail="$MCSVM_HOME/cache/manifests/version_detail_${version}.json"
+  file_server_jar="$MCSVM_HOME/cache/server/${version}.jar"
+  log "found \"$url\" for version in manifest: $mc_version_actual"
+}
+
+function find_server_url ()
+{
+  local file=$1
+  local server_url=$(jq -c '.downloads.server.url' "$file" | tr -d '"')
+
+  if [[ ! $server_url ]] || [[ $server_url == "null" ]]; then
+    log "Server URL for version \"$version\" not found"
+    return
+  fi
+
+  mc_server_url="$server_url"
+}
+
+function main ()
+{
+  home_dir_setup
+  cached_or_download_manifest "$MC_VERSION_MANIFEST_URL" "$file_version_manifest"
+  find_actual_version_from_manifest "$mc_version" "$file_version_manifest"
+  find_version_url "$mc_version_actual" "$file_version_manifest"
+  cached_or_download_manifest "$mc_version_url" "$file_version_manifest_detail"
+  find_server_url "$file_version_manifest_detail"
+  cached_or_download_server "$mc_server_url" "$file_server_jar"
+}
+
+main
+
+# declare -r MC_SNAPSHOT=20w21a
+# declare -r MC_VERSION_URL=$(curl --silent $MC_VERSION_MANIFEST_URL | jq --arg snapshot $MC_SNAPSHOT -c '.versions[] | select(.id | contains($snapshot)) | .url' | tr -d '"')
+# declare -r MC_SERVER_URL=$(curl --silent $MC_VERSION_URL | jq -c '.downloads.server.url' | tr -d '"')
+
+# echo "$MC_VERSION_URL"
+
+# curl --silent ${MC_SERVER_URL} -o server.jar
+
+
+
+
+# cruft...
+# ls -lr "$MCSVM_HOME"/cache
+# echo "verbose -> $verbose"
